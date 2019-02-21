@@ -11,10 +11,10 @@ import (
 	"math/rand"
 	"sync"
 
-	"github.com/syndtr/goleveldb/leveldb/comparer"
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/tfbrother/goleveldb/leveldb/comparer"
+	"github.com/tfbrother/goleveldb/leveldb/errors"
+	"github.com/tfbrother/goleveldb/leveldb/iterator"
+	"github.com/tfbrother/goleveldb/leveldb/util"
 )
 
 // Common errors.

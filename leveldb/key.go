@@ -10,8 +10,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/storage"
+	"github.com/tfbrother/goleveldb/leveldb/errors"
+	"github.com/tfbrother/goleveldb/leveldb/storage"
 )
 
 // ErrInternalKeyCorrupted records internal key corruption.
