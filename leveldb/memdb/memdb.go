@@ -23,13 +23,15 @@ var (
 	ErrIterReleased = errors.New("leveldb/memdb: iterator released")
 )
 
+// 跳表的最大高度
 const tMaxHeight = 12
 
+// DB迭代器
 type dbIter struct {
 	util.BasicReleaser
 	p          *DB
 	slice      *util.Range
-	node       int
+	node       int // 迭代器访问到的p.nodeData中索引地址
 	forward    bool
 	key, value []byte
 	err        error
@@ -43,6 +45,7 @@ func (i *dbIter) fill(checkStart, checkLimit bool) bool {
 		if i.slice != nil {
 			switch {
 			case checkLimit && i.slice.Limit != nil && i.p.cmp.Compare(i.key, i.slice.Limit) >= 0:
+				// fallthrough强制执行下一个case
 				fallthrough
 			case checkStart && i.slice.Start != nil && i.p.cmp.Compare(i.key, i.slice.Start) < 0:
 				i.node = 0
@@ -179,25 +182,29 @@ const (
 )
 
 // DB is an in-memory key/value database.
+// 跳表
 type DB struct {
+	// 比较器
 	cmp comparer.BasicComparer
 	rnd *rand.Rand
 
-	mu     sync.RWMutex
+	mu sync.RWMutex
+	// 真是的保存的k/v数据
 	kvData []byte
 	// Node data:
-	// [0]         : KV offset
+	// [0]         : KV offset	KV数据在kvData中的索引地址
 	// [1]         : Key length
 	// [2]         : Value length
-	// [3]         : Height
-	// [3..height] : Next nodes
-	nodeData  []int
-	prevNode  [tMaxHeight]int
-	maxHeight int
-	n         int
-	kvSize    int
+	// [3]         : Height	当前key所处的高度
+	// [3..height] : Next nodes	当前key在下面层的索引位置
+	nodeData  []int           // 保存的是跳表相关的索引关系
+	prevNode  [tMaxHeight]int // 遍历时缓存查找路径，存储遍历到的每一层的最后一个node
+	maxHeight int             // 跳表的最大高度
+	n         int             // DB内k/v对数据的数量
+	kvSize    int             // 记录DB内k/v对数据总共的大小
 }
 
+// 随机生成一个高度
 func (p *DB) randHeight() (h int) {
 	const branching = 4
 	h = 1
@@ -208,20 +215,27 @@ func (p *DB) randHeight() (h int) {
 }
 
 // Must hold RW-lock if prev == true, as it use shared prevNode slice.
+// 调用方必须要加锁，如果prev == true
+// 如果key存在，返回索引位置和true
+// 如果不存在，返回可以插入的位置和false
 func (p *DB) findGE(key []byte, prev bool) (int, bool) {
+	// 跳表第一个结点初始索引从0开始
 	node := 0
+	// 跳表的分层搜索，从上往下分层搜索
 	h := p.maxHeight - 1
 	for {
 		next := p.nodeData[node+nNext+h]
 		cmp := 1
 		if next != 0 {
 			o := p.nodeData[next]
+			// -1小于，0等于，1大于
 			cmp = p.cmp.Compare(p.kvData[o:o+p.nodeData[next+nKey]], key)
 		}
 		if cmp < 0 {
 			// Keep searching in this list
 			node = next
 		} else {
+			// 只有在Put和Delete中调用时，prev才为true
 			if prev {
 				p.prevNode[h] = node
 			} else if cmp == 0 {
@@ -230,6 +244,7 @@ func (p *DB) findGE(key []byte, prev bool) (int, bool) {
 			if h == 0 {
 				return next, cmp == 0
 			}
+			// 搜索下一层
 			h--
 		}
 	}
@@ -278,6 +293,7 @@ func (p *DB) Put(key []byte, value []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 查看key是否已经存在
 	if node, exact := p.findGE(key, true); exact {
 		kvOffset := len(p.kvData)
 		p.kvData = append(p.kvData, key...)
@@ -289,20 +305,28 @@ func (p *DB) Put(key []byte, value []byte) error {
 		return nil
 	}
 
+	// 跳表插入算法：
+	// 	先确定该元素要占据的层数 K（采用丢硬币的方式，这完全是随机的）
+	//	然后在 Level 1 ... Level K 各个层的链表都插入元素。
+	//	如果 K 大于链表的层数，则要添加新的层。
 	h := p.randHeight()
 	if h > p.maxHeight {
+		// 需要添加新的层
 		for i := p.maxHeight; i < h; i++ {
 			p.prevNode[i] = 0
 		}
 		p.maxHeight = h
 	}
 
+	// TODO 每次都是直接append，实际上kvData的容量限制并没有起到作用？
+	// 那是在何处根据kvData的容量决定把该memdb切换成immutable memdb呢？
 	kvOffset := len(p.kvData)
 	p.kvData = append(p.kvData, key...)
 	p.kvData = append(p.kvData, value...)
 	// Node
 	node := len(p.nodeData)
 	p.nodeData = append(p.nodeData, kvOffset, len(key), len(value), h)
+	// 将数据插入0-(h-1)层
 	for i, n := range p.prevNode[:h] {
 		m := n + nNext + i
 		p.nodeData = append(p.nodeData, p.nodeData[m])
@@ -318,15 +342,18 @@ func (p *DB) Put(key []byte, value []byte) error {
 // the DB does not contain the key.
 //
 // It is safe to modify the contents of the arguments after Delete returns.
+// 在各个层中找到包含 key 的节点，使用标准的 delete from list 方法删除该节点。
 func (p *DB) Delete(key []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 查找节点
 	node, exact := p.findGE(key, true)
 	if !exact {
 		return ErrNotFound
 	}
 
+	// 计算node的高度(层数)
 	h := p.nodeData[node+nHeight]
 	for i, n := range p.prevNode[:h] {
 		m := n + nNext + i
@@ -371,6 +398,8 @@ func (p *DB) Get(key []byte) (value []byte, err error) {
 //
 // The caller should not modify the contents of the returned slice, but
 // it is safe to modify the contents of the argument after Find returns.
+// 客户端调用Get()获取某个key的值时，最终就是调用的这个函数
+// key是InternalKey
 func (p *DB) Find(key []byte) (rkey, value []byte, err error) {
 	p.mu.RLock()
 	if node, _ := p.findGE(key, false); node != 0 {
